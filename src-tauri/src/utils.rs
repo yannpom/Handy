@@ -17,6 +17,9 @@ pub use crate::tray::*;
 pub fn cancel_current_operation(app: &AppHandle) {
     info!("Initiating operation cancellation...");
 
+    // Discard any captured window focus since we're not going to paste
+    crate::window_focus::clear_captured_app();
+
     // Unregister the cancel shortcut asynchronously
     shortcut::unregister_cancel_shortcut(app);
 

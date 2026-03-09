@@ -10,6 +10,7 @@ use crate::tray::{change_tray_icon, TrayIconState};
 use crate::utils::{
     self, show_processing_overlay, show_recording_overlay, show_transcribing_overlay,
 };
+use crate::window_focus;
 use crate::TranscriptionCoordinator;
 use ferrous_opencc::{config::BuiltinConfig, OpenCC};
 use log::{debug, error, warn};
@@ -313,6 +314,14 @@ impl ShortcutAction for TranscribeAction {
         let start_time = Instant::now();
         debug!("TranscribeAction::start called for binding: {}", binding_id);
 
+        // Capture the currently focused app *before* we do anything else.
+        // This lets us restore focus to it before pasting the result,
+        // even if the user switches windows during transcription.
+        let settings = get_settings(app);
+        if settings.restore_focus_before_paste {
+            window_focus::capture_focused_app();
+        }
+
         // Load model in the background
         let tm = app.state::<Arc<TranscriptionManager>>();
         tm.initiate_model_load();
@@ -489,7 +498,13 @@ impl ShortcutAction for TranscribeAction {
                             // Paste the final text (either processed or original)
                             let ah_clone = ah.clone();
                             let paste_time = Instant::now();
+                            let should_restore = settings.restore_focus_before_paste;
                             ah.run_on_main_thread(move || {
+                                // Re-activate the window that was focused when the
+                                // shortcut was pressed, so the paste lands there.
+                                if should_restore {
+                                    window_focus::restore_focused_app();
+                                }
                                 match utils::paste(final_text, ah_clone.clone()) {
                                     Ok(()) => debug!(
                                         "Text pasted successfully in {:?}",
@@ -507,18 +522,21 @@ impl ShortcutAction for TranscribeAction {
                                 change_tray_icon(&ah, TrayIconState::Idle);
                             });
                         } else {
+                            window_focus::clear_captured_app();
                             utils::hide_recording_overlay(&ah);
                             change_tray_icon(&ah, TrayIconState::Idle);
                         }
                     }
                     Err(err) => {
                         debug!("Global Shortcut Transcription error: {}", err);
+                        window_focus::clear_captured_app();
                         utils::hide_recording_overlay(&ah);
                         change_tray_icon(&ah, TrayIconState::Idle);
                     }
                 }
             } else {
                 debug!("No samples retrieved from recording stop");
+                window_focus::clear_captured_app();
                 utils::hide_recording_overlay(&ah);
                 change_tray_icon(&ah, TrayIconState::Idle);
             }

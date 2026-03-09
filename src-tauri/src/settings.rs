@@ -362,6 +362,8 @@ pub struct AppSettings {
     pub external_script_path: Option<String>,
     #[serde(default)]
     pub custom_filler_words: Option<Vec<String>>,
+    #[serde(default = "default_restore_focus_before_paste")]
+    pub restore_focus_before_paste: bool,
 }
 
 fn default_model() -> String {
@@ -572,6 +574,10 @@ fn default_typing_tool() -> TypingTool {
     TypingTool::Auto
 }
 
+fn default_restore_focus_before_paste() -> bool {
+    true
+}
+
 fn ensure_post_process_defaults(settings: &mut AppSettings) -> bool {
     let mut changed = false;
     for provider in default_post_process_providers() {
@@ -727,6 +733,7 @@ pub fn get_default_settings() -> AppSettings {
         typing_tool: default_typing_tool(),
         external_script_path: None,
         custom_filler_words: None,
+        restore_focus_before_paste: default_restore_focus_before_paste(),
     }
 }
 

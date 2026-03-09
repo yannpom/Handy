@@ -296,6 +296,10 @@
           "ctrlEnter": "Ctrl+Enter"
         }
       },
+      "restoreFocus": {
+        "label": "Restore Window Focus",
+        "description": "Remember which window was active when the shortcut was pressed and re-focus it before pasting. Ensures text lands in the correct window even if you switch apps during transcription."
+      },
       "translateToEnglish": {
         "label": "Translate to English",
         "description": "Automatically translate speech from other languages to English during transcription.",

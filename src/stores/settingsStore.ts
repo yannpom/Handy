@@ -135,6 +135,8 @@ const settingUpdaters: {
     commands.changeExperimentalEnabledSetting(value as boolean),
   show_tray_icon: (value) =>
     commands.changeShowTrayIconSetting(value as boolean),
+  restore_focus_before_paste: (value) =>
+    commands.changeRestoreFocusBeforePasteSetting(value as boolean),
 };
 
 export const useSettingsStore = create<SettingsStore>()(

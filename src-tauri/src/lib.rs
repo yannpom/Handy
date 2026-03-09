@@ -19,6 +19,7 @@ mod transcription_coordinator;
 mod tray;
 mod tray_i18n;
 mod utils;
+mod window_focus;
 
 pub use cli::CliArgs;
 use specta_typescript::{BigIntExportBehavior, Typescript};
@@ -301,6 +302,7 @@ pub fn run(cli_args: CliArgs) {
         shortcut::change_update_checks_setting,
         shortcut::change_keyboard_implementation_setting,
         shortcut::get_keyboard_implementation,
+        shortcut::change_restore_focus_before_paste_setting,
         shortcut::change_show_tray_icon_setting,
         shortcut::handy_keys::start_handy_keys_recording,
         shortcut::handy_keys::stop_handy_keys_recording,

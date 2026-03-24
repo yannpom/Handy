@@ -48,12 +48,29 @@ pub fn capture_focused_app() {
 
 /// Re-activate the previously captured window and clear the snapshot.
 /// Returns `true` if focus was successfully restored.
+#[allow(dead_code)]
 pub fn restore_focused_app() -> bool {
     let app = CAPTURED_APP.lock().unwrap().take();
     match app {
         Some(a) => {
             debug!("Restoring focus to: {:?}", a);
             platform_restore(&a)
+        }
+        None => {
+            debug!("No captured app to restore");
+            false
+        }
+    }
+}
+
+/// Re-activate the previously captured window WITHOUT clearing the snapshot.
+/// Used for multi-segment sessions where we paste multiple times.
+pub fn restore_focused_app_keep() -> bool {
+    let app = CAPTURED_APP.lock().unwrap();
+    match app.as_ref() {
+        Some(a) => {
+            debug!("Restoring focus to (keeping capture): {:?}", a);
+            platform_restore(a)
         }
         None => {
             debug!("No captured app to restore");

@@ -7,41 +7,404 @@ use crate::managers::transcription::TranscriptionManager;
 use crate::settings::{get_settings, AppSettings, APPLE_INTELLIGENCE_PROVIDER_ID};
 use crate::shortcut;
 use crate::tray::{change_tray_icon, TrayIconState};
-use crate::utils::{
-    self, show_processing_overlay, show_recording_overlay, show_transcribing_overlay,
-};
+use crate::utils::{self, show_processing_overlay, show_recording_overlay, show_transcribing_overlay};
 use crate::window_focus;
 use crate::TranscriptionCoordinator;
 use ferrous_opencc::{config::BuiltinConfig, OpenCC};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 use tauri::AppHandle;
 use tauri::Manager;
 
-/// Drop guard that notifies the [`TranscriptionCoordinator`] when the
-/// transcription pipeline finishes — whether it completes normally or panics.
-struct FinishGuard(AppHandle);
-impl Drop for FinishGuard {
+// ── PasteQueue ─────────────────────────────────────────────────────────
+
+/// Ensures segments within a session paste in recording order.
+pub struct PasteQueue {
+    next_to_paste: Mutex<u64>,
+    condvar: Condvar,
+}
+
+impl PasteQueue {
+    pub fn new() -> Self {
+        Self {
+            next_to_paste: Mutex::new(0),
+            condvar: Condvar::new(),
+        }
+    }
+
+    /// Block until it is this segment's turn to paste.
+    fn wait_for_turn(&self, my_sequence: u64) {
+        let mut next = self.next_to_paste.lock().unwrap();
+        while *next != my_sequence {
+            next = self.condvar.wait(next).unwrap();
+        }
+    }
+
+    /// Signal that this segment's paste is done; wake the next.
+    fn advance(&self) {
+        let mut next = self.next_to_paste.lock().unwrap();
+        *next += 1;
+        self.condvar.notify_all();
+    }
+}
+
+// ── SegmentFinishGuard ─────────────────────────────────────────────────
+
+/// Drop guard that notifies the [`TranscriptionCoordinator`] when a
+/// segment's async pipeline finishes — whether it completes normally or panics.
+struct SegmentFinishGuard(AppHandle);
+
+impl Drop for SegmentFinishGuard {
     fn drop(&mut self) {
         if let Some(c) = self.0.try_state::<TranscriptionCoordinator>() {
-            c.notify_processing_finished();
+            c.notify_segment_finished();
         }
     }
 }
 
-// Shortcut Action Trait
+// ── Segment lifecycle (called by the coordinator) ──────────────────────
+
+/// Start recording a segment. Returns `true` if recording actually started.
+///
+/// When `is_first_segment` is `true`, captures the focused window, initiates
+/// model loading, plays the start sound, and registers the cancel shortcut.
+/// Continuation segments skip these one-time actions.
+pub fn start_segment(app: &AppHandle, binding_id: &str, is_first_segment: bool) -> bool {
+    let start_time = Instant::now();
+    info!(
+        "start_segment called for binding: {} (first: {})",
+        binding_id, is_first_segment
+    );
+
+    // ── Start recording FIRST for minimum latency ──────────────────
+    let rm = app.state::<Arc<AudioRecordingManager>>();
+    let binding_id_owned = binding_id.to_string();
+
+    let recording_started = rm.try_start_recording(&binding_id_owned);
+    info!(
+        "Recording started: {} (in {:?})",
+        recording_started,
+        start_time.elapsed()
+    );
+
+    if !recording_started {
+        debug!("Failed to start recording");
+        return false;
+    }
+
+    // ── Now do the rest (window capture, model, UI, sound) ─────────
+    let settings = get_settings(app);
+
+    if is_first_segment {
+        if settings.restore_focus_before_paste {
+            window_focus::capture_focused_app();
+        }
+
+        // Load model in the background
+        let tm = app.state::<Arc<TranscriptionManager>>();
+        tm.initiate_model_load();
+    }
+
+    change_tray_icon(app, TrayIconState::Recording);
+    show_recording_overlay(app);
+
+    // Audio feedback + mute in background thread
+    if is_first_segment {
+        let rm_clone = Arc::clone(&rm);
+        let app_clone = app.clone();
+        std::thread::spawn(move || {
+            play_feedback_sound_blocking(&app_clone, SoundType::Start);
+            rm_clone.apply_mute();
+        });
+    } else {
+        let rm_clone = Arc::clone(&rm);
+        std::thread::spawn(move || {
+            rm_clone.apply_mute();
+        });
+    }
+
+    if recording_started && is_first_segment {
+        shortcut::register_cancel_shortcut(app);
+    }
+
+    debug!("start_segment completed in {:?}", start_time.elapsed());
+    recording_started
+}
+
+/// Stop recording a segment and spawn the async transcription pipeline.
+///
+/// Audio samples are retrieved synchronously (fast) so the audio manager
+/// is immediately available for a new recording. The actual transcription,
+/// post-processing, and paste run in an async task.
+pub fn stop_segment(
+    app: &AppHandle,
+    binding_id: &str,
+    post_process: bool,
+    cancel_token: Arc<AtomicBool>,
+    paste_queue: Arc<PasteQueue>,
+    segment_seq: u64,
+) {
+    let stop_time = Instant::now();
+    debug!(
+        "stop_segment called for binding: {} (seq: {})",
+        binding_id, segment_seq
+    );
+
+    let rm = Arc::clone(&app.state::<Arc<AudioRecordingManager>>());
+    let tm = Arc::clone(&app.state::<Arc<TranscriptionManager>>());
+    let hm = Arc::clone(&app.state::<Arc<HistoryManager>>());
+
+    // Unmute before playing audio feedback so the stop sound is audible
+    rm.remove_mute();
+
+    // Play audio feedback for recording stop
+    play_feedback_sound(app, SoundType::Stop);
+
+    // Retrieve samples synchronously so the audio manager is immediately
+    // free for a new recording. Keep the mic stream open to avoid latency
+    // if the user starts a continuation segment right away.
+    let binding_id = binding_id.to_string();
+    let samples = rm.stop_recording_keep_stream(&binding_id);
+
+    // Update UI to show transcribing state
+    change_tray_icon(app, TrayIconState::Transcribing);
+    show_transcribing_overlay(app);
+
+    let ah = app.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let _guard = SegmentFinishGuard(ah.clone());
+        debug!(
+            "Starting async transcription task for segment {} (binding: {})",
+            segment_seq, binding_id
+        );
+
+        let Some(samples) = samples else {
+            debug!(
+                "No samples retrieved from recording stop (segment {})",
+                segment_seq
+            );
+            paste_queue.wait_for_turn(segment_seq);
+            paste_queue.advance();
+            return;
+        };
+
+        debug!(
+            "Segment {} samples retrieved, count: {}",
+            segment_seq,
+            samples.len()
+        );
+
+        // Check cancellation before transcribing
+        if cancel_token.load(Ordering::Relaxed) {
+            debug!("Segment {} cancelled before transcription", segment_seq);
+            paste_queue.wait_for_turn(segment_seq);
+            paste_queue.advance();
+            return;
+        }
+
+        let transcription_time = Instant::now();
+        let samples_clone = samples.clone();
+        match tm.transcribe(samples) {
+            Ok(transcription) => {
+                debug!(
+                    "Segment {} transcription completed in {:?}: '{}'",
+                    segment_seq,
+                    transcription_time.elapsed(),
+                    transcription
+                );
+
+                if transcription.is_empty() {
+                    paste_queue.wait_for_turn(segment_seq);
+                    paste_queue.advance();
+                    return;
+                }
+
+                let settings = get_settings(&ah);
+                let mut final_text = transcription.clone();
+                let mut post_processed_text: Option<String> = None;
+                let mut post_process_prompt: Option<String> = None;
+
+                // Chinese variant conversion
+                if let Some(converted_text) =
+                    maybe_convert_chinese_variant(&settings, &transcription).await
+                {
+                    final_text = converted_text;
+                }
+
+                // Check cancellation before post-processing
+                if cancel_token.load(Ordering::Relaxed) {
+                    debug!("Segment {} cancelled before post-processing", segment_seq);
+                    paste_queue.wait_for_turn(segment_seq);
+                    paste_queue.advance();
+                    return;
+                }
+
+                // LLM post-processing
+                if post_process {
+                    // Only show processing overlay if not currently recording
+                    let is_recording = ah
+                        .try_state::<Arc<AudioRecordingManager>>()
+                        .is_some_and(|a| a.is_recording());
+                    if !is_recording {
+                        show_processing_overlay(&ah);
+                    }
+                }
+
+                let processed = if post_process {
+                    post_process_transcription(&settings, &final_text).await
+                } else {
+                    None
+                };
+
+                if let Some(processed_text) = processed {
+                    post_processed_text = Some(processed_text.clone());
+                    final_text = processed_text;
+
+                    if let Some(prompt_id) = &settings.post_process_selected_prompt_id {
+                        if let Some(prompt) = settings
+                            .post_process_prompts
+                            .iter()
+                            .find(|p| &p.id == prompt_id)
+                        {
+                            post_process_prompt = Some(prompt.prompt.clone());
+                        }
+                    }
+                } else if final_text != transcription {
+                    // Chinese conversion was applied but no LLM post-processing
+                    post_processed_text = Some(final_text.clone());
+                }
+
+                // Save to history
+                let hm_clone = Arc::clone(&hm);
+                let transcription_for_history = transcription.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = hm_clone
+                        .save_transcription(
+                            samples_clone,
+                            transcription_for_history,
+                            post_processed_text,
+                            post_process_prompt,
+                        )
+                        .await
+                    {
+                        error!("Failed to save transcription to history: {}", e);
+                    }
+                });
+
+                // Wait for our turn to paste (ensures ordering)
+                paste_queue.wait_for_turn(segment_seq);
+
+                // Check cancellation one last time before pasting
+                if cancel_token.load(Ordering::Relaxed) {
+                    debug!("Segment {} cancelled before paste", segment_seq);
+                    paste_queue.advance();
+                    return;
+                }
+
+                let ah_clone = ah.clone();
+                let paste_time = Instant::now();
+                let should_restore = settings.restore_focus_before_paste;
+                let seg = segment_seq;
+                ah.run_on_main_thread(move || {
+                    if should_restore {
+                        window_focus::restore_focused_app_keep();
+                    }
+                    match utils::paste(final_text, ah_clone.clone()) {
+                        Ok(()) => debug!(
+                            "Segment {} text pasted successfully in {:?}",
+                            seg,
+                            paste_time.elapsed()
+                        ),
+                        Err(e) => {
+                            error!("Failed to paste segment {} transcription: {}", seg, e)
+                        }
+                    }
+                })
+                .unwrap_or_else(|e| {
+                    error!("Failed to run paste on main thread: {:?}", e);
+                });
+
+                paste_queue.advance();
+            }
+            Err(err) => {
+                debug!("Segment {} transcription error: {}", segment_seq, err);
+                paste_queue.wait_for_turn(segment_seq);
+                paste_queue.advance();
+            }
+        }
+    });
+
+    debug!("stop_segment completed in {:?}", stop_time.elapsed());
+}
+
+// ── Shortcut Action Trait ──────────────────────────────────────────────
+
 pub trait ShortcutAction: Send + Sync {
     fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str);
     fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str);
 }
 
-// Transcribe Action
-struct TranscribeAction {
-    post_process: bool,
+// ── Cancel Action ──────────────────────────────────────────────────────
+
+struct CancelAction;
+
+impl ShortcutAction for CancelAction {
+    fn start(&self, app: &AppHandle, _binding_id: &str, _shortcut_str: &str) {
+        utils::cancel_current_operation(app);
+    }
+
+    fn stop(&self, _app: &AppHandle, _binding_id: &str, _shortcut_str: &str) {
+        // Nothing to do on stop for cancel
+    }
 }
+
+// ── Test Action ────────────────────────────────────────────────────────
+
+struct TestAction;
+
+impl ShortcutAction for TestAction {
+    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) {
+        log::info!(
+            "Shortcut ID '{}': Started - {} (App: {})",
+            binding_id,
+            shortcut_str,
+            app.package_info().name
+        );
+    }
+
+    fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) {
+        log::info!(
+            "Shortcut ID '{}': Stopped - {} (App: {})",
+            binding_id,
+            shortcut_str,
+            app.package_info().name
+        );
+    }
+}
+
+// ── Action Map ─────────────────────────────────────────────────────────
+// Transcribe actions are handled directly by the coordinator via
+// start_segment / stop_segment.  Only non-transcribe actions live here.
+
+pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::new(|| {
+    let mut map = HashMap::new();
+    map.insert(
+        "cancel".to_string(),
+        Arc::new(CancelAction) as Arc<dyn ShortcutAction>,
+    );
+    map.insert(
+        "test".to_string(),
+        Arc::new(TestAction) as Arc<dyn ShortcutAction>,
+    );
+    map
+});
+
+// ── Helper functions (unchanged) ───────────────────────────────────────
 
 /// Field name for structured output JSON schema
 const TRANSCRIPTION_FIELD: &str = "transcription";
@@ -308,303 +671,3 @@ async fn maybe_convert_chinese_variant(
         }
     }
 }
-
-impl ShortcutAction for TranscribeAction {
-    fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
-        let start_time = Instant::now();
-        debug!("TranscribeAction::start called for binding: {}", binding_id);
-
-        // Capture the currently focused app *before* we do anything else.
-        // This lets us restore focus to it before pasting the result,
-        // even if the user switches windows during transcription.
-        let settings = get_settings(app);
-        if settings.restore_focus_before_paste {
-            window_focus::capture_focused_app();
-        }
-
-        // Load model in the background
-        let tm = app.state::<Arc<TranscriptionManager>>();
-        tm.initiate_model_load();
-
-        let binding_id = binding_id.to_string();
-        change_tray_icon(app, TrayIconState::Recording);
-        show_recording_overlay(app);
-
-        let rm = app.state::<Arc<AudioRecordingManager>>();
-
-        // Get the microphone mode to determine audio feedback timing
-        let settings = get_settings(app);
-        let is_always_on = settings.always_on_microphone;
-        debug!("Microphone mode - always_on: {}", is_always_on);
-
-        let mut recording_started = false;
-        if is_always_on {
-            // Always-on mode: Play audio feedback immediately, then apply mute after sound finishes
-            debug!("Always-on mode: Playing audio feedback immediately");
-            let rm_clone = Arc::clone(&rm);
-            let app_clone = app.clone();
-            // The blocking helper exits immediately if audio feedback is disabled,
-            // so we can always reuse this thread to ensure mute happens right after playback.
-            std::thread::spawn(move || {
-                play_feedback_sound_blocking(&app_clone, SoundType::Start);
-                rm_clone.apply_mute();
-            });
-
-            recording_started = rm.try_start_recording(&binding_id);
-            debug!("Recording started: {}", recording_started);
-        } else {
-            // On-demand mode: Start recording first, then play audio feedback, then apply mute
-            // This allows the microphone to be activated before playing the sound
-            debug!("On-demand mode: Starting recording first, then audio feedback");
-            let recording_start_time = Instant::now();
-            if rm.try_start_recording(&binding_id) {
-                recording_started = true;
-                debug!("Recording started in {:?}", recording_start_time.elapsed());
-                // Small delay to ensure microphone stream is active
-                let app_clone = app.clone();
-                let rm_clone = Arc::clone(&rm);
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    debug!("Handling delayed audio feedback/mute sequence");
-                    // Helper handles disabled audio feedback by returning early, so we reuse it
-                    // to keep mute sequencing consistent in every mode.
-                    play_feedback_sound_blocking(&app_clone, SoundType::Start);
-                    rm_clone.apply_mute();
-                });
-            } else {
-                debug!("Failed to start recording");
-            }
-        }
-
-        if recording_started {
-            // Dynamically register the cancel shortcut in a separate task to avoid deadlock
-            shortcut::register_cancel_shortcut(app);
-        }
-
-        debug!(
-            "TranscribeAction::start completed in {:?}",
-            start_time.elapsed()
-        );
-    }
-
-    fn stop(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
-        // Unregister the cancel shortcut when transcription stops
-        shortcut::unregister_cancel_shortcut(app);
-
-        let stop_time = Instant::now();
-        debug!("TranscribeAction::stop called for binding: {}", binding_id);
-
-        let ah = app.clone();
-        let rm = Arc::clone(&app.state::<Arc<AudioRecordingManager>>());
-        let tm = Arc::clone(&app.state::<Arc<TranscriptionManager>>());
-        let hm = Arc::clone(&app.state::<Arc<HistoryManager>>());
-
-        change_tray_icon(app, TrayIconState::Transcribing);
-        show_transcribing_overlay(app);
-
-        // Unmute before playing audio feedback so the stop sound is audible
-        rm.remove_mute();
-
-        // Play audio feedback for recording stop
-        play_feedback_sound(app, SoundType::Stop);
-
-        let binding_id = binding_id.to_string(); // Clone binding_id for the async task
-        let post_process = self.post_process;
-
-        tauri::async_runtime::spawn(async move {
-            let _guard = FinishGuard(ah.clone());
-            let binding_id = binding_id.clone(); // Clone for the inner async task
-            debug!(
-                "Starting async transcription task for binding: {}",
-                binding_id
-            );
-
-            let stop_recording_time = Instant::now();
-            if let Some(samples) = rm.stop_recording(&binding_id) {
-                debug!(
-                    "Recording stopped and samples retrieved in {:?}, sample count: {}",
-                    stop_recording_time.elapsed(),
-                    samples.len()
-                );
-
-                let transcription_time = Instant::now();
-                let samples_clone = samples.clone(); // Clone for history saving
-                match tm.transcribe(samples) {
-                    Ok(transcription) => {
-                        debug!(
-                            "Transcription completed in {:?}: '{}'",
-                            transcription_time.elapsed(),
-                            transcription
-                        );
-                        if !transcription.is_empty() {
-                            let settings = get_settings(&ah);
-                            let mut final_text = transcription.clone();
-                            let mut post_processed_text: Option<String> = None;
-                            let mut post_process_prompt: Option<String> = None;
-
-                            // First, check if Chinese variant conversion is needed
-                            if let Some(converted_text) =
-                                maybe_convert_chinese_variant(&settings, &transcription).await
-                            {
-                                final_text = converted_text;
-                            }
-
-                            // Then apply LLM post-processing if this is the post-process hotkey
-                            // Uses final_text which may already have Chinese conversion applied
-                            if post_process {
-                                show_processing_overlay(&ah);
-                            }
-                            let processed = if post_process {
-                                post_process_transcription(&settings, &final_text).await
-                            } else {
-                                None
-                            };
-                            if let Some(processed_text) = processed {
-                                post_processed_text = Some(processed_text.clone());
-                                final_text = processed_text;
-
-                                // Get the prompt that was used
-                                if let Some(prompt_id) = &settings.post_process_selected_prompt_id {
-                                    if let Some(prompt) = settings
-                                        .post_process_prompts
-                                        .iter()
-                                        .find(|p| &p.id == prompt_id)
-                                    {
-                                        post_process_prompt = Some(prompt.prompt.clone());
-                                    }
-                                }
-                            } else if final_text != transcription {
-                                // Chinese conversion was applied but no LLM post-processing
-                                post_processed_text = Some(final_text.clone());
-                            }
-
-                            // Save to history with post-processed text and prompt
-                            let hm_clone = Arc::clone(&hm);
-                            let transcription_for_history = transcription.clone();
-                            tauri::async_runtime::spawn(async move {
-                                if let Err(e) = hm_clone
-                                    .save_transcription(
-                                        samples_clone,
-                                        transcription_for_history,
-                                        post_processed_text,
-                                        post_process_prompt,
-                                    )
-                                    .await
-                                {
-                                    error!("Failed to save transcription to history: {}", e);
-                                }
-                            });
-
-                            // Paste the final text (either processed or original)
-                            let ah_clone = ah.clone();
-                            let paste_time = Instant::now();
-                            let should_restore = settings.restore_focus_before_paste;
-                            ah.run_on_main_thread(move || {
-                                // Re-activate the window that was focused when the
-                                // shortcut was pressed, so the paste lands there.
-                                if should_restore {
-                                    window_focus::restore_focused_app();
-                                }
-                                match utils::paste(final_text, ah_clone.clone()) {
-                                    Ok(()) => debug!(
-                                        "Text pasted successfully in {:?}",
-                                        paste_time.elapsed()
-                                    ),
-                                    Err(e) => error!("Failed to paste transcription: {}", e),
-                                }
-                                // Hide the overlay after transcription is complete
-                                utils::hide_recording_overlay(&ah_clone);
-                                change_tray_icon(&ah_clone, TrayIconState::Idle);
-                            })
-                            .unwrap_or_else(|e| {
-                                error!("Failed to run paste on main thread: {:?}", e);
-                                utils::hide_recording_overlay(&ah);
-                                change_tray_icon(&ah, TrayIconState::Idle);
-                            });
-                        } else {
-                            window_focus::clear_captured_app();
-                            utils::hide_recording_overlay(&ah);
-                            change_tray_icon(&ah, TrayIconState::Idle);
-                        }
-                    }
-                    Err(err) => {
-                        debug!("Global Shortcut Transcription error: {}", err);
-                        window_focus::clear_captured_app();
-                        utils::hide_recording_overlay(&ah);
-                        change_tray_icon(&ah, TrayIconState::Idle);
-                    }
-                }
-            } else {
-                debug!("No samples retrieved from recording stop");
-                window_focus::clear_captured_app();
-                utils::hide_recording_overlay(&ah);
-                change_tray_icon(&ah, TrayIconState::Idle);
-            }
-        });
-
-        debug!(
-            "TranscribeAction::stop completed in {:?}",
-            stop_time.elapsed()
-        );
-    }
-}
-
-// Cancel Action
-struct CancelAction;
-
-impl ShortcutAction for CancelAction {
-    fn start(&self, app: &AppHandle, _binding_id: &str, _shortcut_str: &str) {
-        utils::cancel_current_operation(app);
-    }
-
-    fn stop(&self, _app: &AppHandle, _binding_id: &str, _shortcut_str: &str) {
-        // Nothing to do on stop for cancel
-    }
-}
-
-// Test Action
-struct TestAction;
-
-impl ShortcutAction for TestAction {
-    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) {
-        log::info!(
-            "Shortcut ID '{}': Started - {} (App: {})", // Changed "Pressed" to "Started" for consistency
-            binding_id,
-            shortcut_str,
-            app.package_info().name
-        );
-    }
-
-    fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) {
-        log::info!(
-            "Shortcut ID '{}': Stopped - {} (App: {})", // Changed "Released" to "Stopped" for consistency
-            binding_id,
-            shortcut_str,
-            app.package_info().name
-        );
-    }
-}
-
-// Static Action Map
-pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::new(|| {
-    let mut map = HashMap::new();
-    map.insert(
-        "transcribe".to_string(),
-        Arc::new(TranscribeAction {
-            post_process: false,
-        }) as Arc<dyn ShortcutAction>,
-    );
-    map.insert(
-        "transcribe_with_post_process".to_string(),
-        Arc::new(TranscribeAction { post_process: true }) as Arc<dyn ShortcutAction>,
-    );
-    map.insert(
-        "cancel".to_string(),
-        Arc::new(CancelAction) as Arc<dyn ShortcutAction>,
-    );
-    map.insert(
-        "test".to_string(),
-        Arc::new(TestAction) as Arc<dyn ShortcutAction>,
-    );
-    map
-});

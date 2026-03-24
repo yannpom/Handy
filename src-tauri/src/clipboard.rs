@@ -593,9 +593,17 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
     let paste_method = settings.paste_method;
     let paste_delay_ms = settings.paste_delay_ms;
 
-    // Append trailing space if setting is enabled
+    // Append trailing period + space if the text doesn't already end with
+    // sentence-ending punctuation, or just a trailing space if it does.
     let text = if settings.append_trailing_space {
-        format!("{} ", text)
+        let trimmed = text.trim_end();
+        if trimmed.is_empty() {
+            text
+        } else if trimmed.ends_with(|c: char| matches!(c, '.' | '!' | '?' | '…' | '。' | '！' | '？')) {
+            format!("{} ", trimmed)
+        } else {
+            format!("{}. ", trimmed)
+        }
     } else {
         text
     };

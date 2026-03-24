@@ -49,6 +49,10 @@ enum LoadedEngine {
 #[derive(Clone)]
 pub struct TranscriptionManager {
     engine: Arc<Mutex<Option<LoadedEngine>>>,
+    /// Serialises `transcribe()` calls so that only one runs at a time.
+    /// Without this, a second caller would find the engine taken out of the
+    /// mutex by the first caller and fail immediately.
+    transcribe_lock: Arc<Mutex<()>>,
     model_manager: Arc<ModelManager>,
     app_handle: AppHandle,
     current_model_id: Arc<Mutex<Option<String>>>,
@@ -63,6 +67,7 @@ impl TranscriptionManager {
     pub fn new(app_handle: &AppHandle, model_manager: Arc<ModelManager>) -> Result<Self> {
         let manager = Self {
             engine: Arc::new(Mutex::new(None)),
+            transcribe_lock: Arc::new(Mutex::new(())),
             model_manager,
             app_handle: app_handle.clone(),
             current_model_id: Arc::new(Mutex::new(None)),
@@ -424,6 +429,13 @@ impl TranscriptionManager {
     }
 
     pub fn transcribe(&self, audio: Vec<f32>) -> Result<String> {
+        // Serialize: only one transcription at a time.  A second caller
+        // blocks here until the first finishes and puts the engine back.
+        let _transcribe_guard = self
+            .transcribe_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         // Update last activity timestamp
         self.last_activity.store(
             SystemTime::now()

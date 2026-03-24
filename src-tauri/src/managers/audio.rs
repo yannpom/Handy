@@ -371,6 +371,17 @@ impl AudioRecordingManager {
     }
 
     pub fn stop_recording(&self, binding_id: &str) -> Option<Vec<f32>> {
+        self.stop_recording_inner(binding_id, true)
+    }
+
+    /// Stop recording but keep the microphone stream open.
+    /// Use this between segments of a multi-segment session to avoid the
+    /// latency of closing and reopening the audio stream.
+    pub fn stop_recording_keep_stream(&self, binding_id: &str) -> Option<Vec<f32>> {
+        self.stop_recording_inner(binding_id, false)
+    }
+
+    fn stop_recording_inner(&self, binding_id: &str, close_stream: bool) -> Option<Vec<f32>> {
         let mut state = self.state.lock().unwrap();
 
         match *state {
@@ -395,14 +406,15 @@ impl AudioRecordingManager {
 
                 *self.is_recording.lock().unwrap() = false;
 
-                // In on-demand mode turn the mic off again
-                if matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand) {
+                // In on-demand mode turn the mic off again (unless caller wants to keep it)
+                if close_stream
+                    && matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand)
+                {
                     self.stop_microphone_stream();
                 }
 
                 // Pad if very short
                 let s_len = samples.len();
-                // debug!("Got {} samples", s_len);
                 if s_len < WHISPER_SAMPLE_RATE && s_len > 0 {
                     let mut padded = samples;
                     padded.resize(WHISPER_SAMPLE_RATE * 5 / 4, 0.0);
@@ -412,6 +424,16 @@ impl AudioRecordingManager {
                 }
             }
             _ => None,
+        }
+    }
+
+    /// Close the microphone stream if in on-demand mode and not recording.
+    /// Called by the coordinator when a multi-segment session ends.
+    pub fn close_stream_if_on_demand(&self) {
+        if matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand) {
+            if !*self.is_recording.lock().unwrap() {
+                self.stop_microphone_stream();
+            }
         }
     }
     pub fn is_recording(&self) -> bool {

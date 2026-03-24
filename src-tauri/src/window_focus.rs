@@ -169,13 +169,60 @@ end tell
 }
 
 #[cfg(target_os = "macos")]
+extern "C" {
+    fn CGEventSourceButtonState(state_id: u32, button: u32) -> bool;
+    fn CGEventSourceFlagsState(state_id: u32) -> u64;
+}
+
+/// Wait for safe input state before restoring focus.
+/// Checks that:
+/// - Left mouse button is released (user is not mid-drag)
+/// - Cmd/Option keys are released (user is not in Cmd+Tab app switcher)
+#[cfg(target_os = "macos")]
+fn wait_for_safe_input_state() {
+    // Use HIDSystemState (1) instead of CombinedSessionState (0) to read
+    // the actual physical key/button state.  CombinedSessionState includes
+    // synthetic events from global shortcut hooks which can report stale
+    // modifier flags.
+    const HID_SYSTEM_STATE: u32 = 1;
+    const LEFT_BUTTON: u32 = 0;
+    const CMD_FLAG: u64 = 0x100000; // kCGEventFlagMaskCommand
+    const ALT_FLAG: u64 = 0x80000; // kCGEventFlagMaskAlternate
+
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(30);
+
+    loop {
+        let mouse_held =
+            unsafe { CGEventSourceButtonState(HID_SYSTEM_STATE, LEFT_BUTTON) };
+        let flags = unsafe { CGEventSourceFlagsState(HID_SYSTEM_STATE) };
+        let modifier_held = (flags & (CMD_FLAG | ALT_FLAG)) != 0;
+
+        if !mouse_held && !modifier_held {
+            break;
+        }
+
+        if start.elapsed() > timeout {
+            warn!("Timed out waiting for safe input state (mouse: {}, modifiers: {:#x})", mouse_held, flags);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn platform_restore(app: &FocusedApp) -> bool {
     use std::process::Command;
 
+    // Wait for safe input state: no mouse drag, no Cmd+Tab app switcher.
+    // Always check, even if the target app appears focused — the app switcher
+    // overlay doesn't change the frontmost app until Cmd is released.
+    wait_for_safe_input_state();
+
     // Build a restore script that:
-    // 1. Activates the correct application (by PID)
-    // 2. Tries to AXRaise the exact window by matching title + position + size
-    // 3. Falls back to title-only match (window may have moved/resized)
+    // 1. AXRaise the exact window by matching title + position + size
+    // 2. Falls back to title-only match (window may have moved/resized)
+    // 3. Activates the app via NSRunningApplication (without raising all windows)
     // 4. Falls back to app-level activation (current behaviour) if no match
 
     let title_escaped = app
@@ -192,9 +239,10 @@ fn platform_restore(app: &FocusedApp) -> bool {
     let script = if has_window_info {
         format!(
             r#"
+use framework "AppKit"
+
 tell application "System Events"
     set targetProc to first process whose unix id is {pid}
-    set frontmost of targetProc to true
     set matched to false
 
     -- Try to match by title + position + size (most precise)
@@ -224,6 +272,13 @@ tell application "System Events"
         end repeat
     end if
 end tell
+
+-- Activate the app using NSRunningApplication with ONLY
+-- NSApplicationActivateIgnoringOtherApps (2), WITHOUT
+-- NSApplicationActivateAllWindows (1).
+-- This brings the app forward without raising all its windows.
+set targetNSApp to current application's NSRunningApplication's runningApplicationWithProcessIdentifier:{pid}
+targetNSApp's activateWithOptions:2
 "#,
             pid = app.pid,
             title = title_escaped,

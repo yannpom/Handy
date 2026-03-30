@@ -79,6 +79,10 @@
       "gigaam-v3-e2e-ctc": {
         "name": "GigaAM v3",
         "description": "ロシア語音声認識。高速かつ高精度。"
+      },
+      "distil-large-v3-fr": {
+        "name": "Distil Large V3 FR",
+        "description": "フランス語に最適化。Whisper Largeの5.9倍高速。"
       }
     },
     "errors": {

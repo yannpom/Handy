@@ -79,6 +79,10 @@
       "gigaam-v3-e2e-ctc": {
         "name": "GigaAM v3",
         "description": "Rozpoznávání ruské řeči. Rychlé a přesné."
+      },
+      "distil-large-v3-fr": {
+        "name": "Distil Large V3 FR",
+        "description": "Optimalizovaný pro francouzštinu. 5,9x rychlejší než Whisper Large."
       }
     },
     "errors": {

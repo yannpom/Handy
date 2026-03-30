@@ -79,6 +79,10 @@
       "gigaam-v3-e2e-ctc": {
         "name": "GigaAM v3",
         "description": "Распознавание русской речи. Быстро и точно."
+      },
+      "distil-large-v3-fr": {
+        "name": "Distil Large V3 FR",
+        "description": "Оптимизирован для французского. В 5,9 раз быстрее Whisper Large."
       }
     },
     "errors": {

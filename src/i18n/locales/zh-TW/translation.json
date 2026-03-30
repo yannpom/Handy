@@ -79,6 +79,10 @@
       "gigaam-v3-e2e-ctc": {
         "name": "GigaAM v3",
         "description": "俄語語音辨識。快速且準確。"
+      },
+      "distil-large-v3-fr": {
+        "name": "Distil Large V3 FR",
+        "description": "針對法語優化。比 Whisper Large 快 5.9 倍。"
       }
     },
     "errors": {

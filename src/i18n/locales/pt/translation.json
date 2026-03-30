@@ -79,6 +79,10 @@
       "gigaam-v3-e2e-ctc": {
         "name": "GigaAM v3",
         "description": "Reconhecimento de voz em russo. Rápido e preciso."
+      },
+      "distil-large-v3-fr": {
+        "name": "Distil Large V3 FR",
+        "description": "Otimizado para francês. 5,9x mais rápido que o Whisper Large."
       }
     },
     "errors": {

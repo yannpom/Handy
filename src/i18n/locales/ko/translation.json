@@ -79,6 +79,10 @@
       "gigaam-v3-e2e-ctc": {
         "name": "GigaAM v3",
         "description": "러시아어 음성 인식. 빠르고 정확함."
+      },
+      "distil-large-v3-fr": {
+        "name": "Distil Large V3 FR",
+        "description": "프랑스어에 최적화. Whisper Large보다 5.9배 빠름."
       }
     },
     "errors": {

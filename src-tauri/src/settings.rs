@@ -364,6 +364,10 @@ pub struct AppSettings {
     pub custom_filler_words: Option<Vec<String>>,
     #[serde(default = "default_restore_focus_before_paste")]
     pub restore_focus_before_paste: bool,
+    #[serde(default)]
+    pub pause_apps_during_transcription: bool,
+    #[serde(default = "default_pause_apps_list")]
+    pub pause_apps_list: Vec<String>,
 }
 
 fn default_model() -> String {
@@ -578,6 +582,10 @@ fn default_restore_focus_before_paste() -> bool {
     true
 }
 
+fn default_pause_apps_list() -> Vec<String> {
+    vec!["Blender".to_string()]
+}
+
 fn ensure_post_process_defaults(settings: &mut AppSettings) -> bool {
     let mut changed = false;
     for provider in default_post_process_providers() {
@@ -734,6 +742,8 @@ pub fn get_default_settings() -> AppSettings {
         external_script_path: None,
         custom_filler_words: None,
         restore_focus_before_paste: default_restore_focus_before_paste(),
+        pause_apps_during_transcription: false,
+        pause_apps_list: default_pause_apps_list(),
     }
 }
 

@@ -137,6 +137,9 @@ const settingUpdaters: {
     commands.changeShowTrayIconSetting(value as boolean),
   restore_focus_before_paste: (value) =>
     commands.changeRestoreFocusBeforePasteSetting(value as boolean),
+  pause_apps_during_transcription: (value) =>
+    commands.changePauseAppsDuringTranscriptionSetting(value as boolean),
+  pause_apps_list: (value) => commands.updatePauseAppsList(value as string[]),
 };
 
 export const useSettingsStore = create<SettingsStore>()(

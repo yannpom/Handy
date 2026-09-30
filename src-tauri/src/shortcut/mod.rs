@@ -1067,6 +1067,27 @@ pub fn change_restore_focus_before_paste_setting(
 
 #[tauri::command]
 #[specta::specta]
+pub fn change_pause_apps_during_transcription_setting(
+    app: AppHandle,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    settings.pause_apps_during_transcription = enabled;
+    settings::write_settings(&app, settings);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn update_pause_apps_list(app: AppHandle, apps: Vec<String>) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    settings.pause_apps_list = apps;
+    settings::write_settings(&app, settings);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
 pub fn change_show_tray_icon_setting(app: AppHandle, enabled: bool) -> Result<(), String> {
     let mut settings = settings::get_settings(&app);
     settings.show_tray_icon = enabled;

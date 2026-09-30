@@ -326,6 +326,16 @@
         "add": "Ajouter",
         "remove": "Supprimer {{word}}",
         "duplicate": "\"{{word}}\" existe déjà"
+      },
+      "pauseApps": {
+        "label": "Mettre en pause des apps pendant la transcription",
+        "description": "Gèle les applications listées ci-dessous (par ex. un rendu Blender) pendant que Handy transcrit, pour que le modèle vocal ait le GPU et le CPU pour lui seul. Elles reprennent automatiquement dès que le texte est prêt.",
+        "placeholder": "Nom de l'app",
+        "add": "Ajouter",
+        "remove": "Retirer {{app}}",
+        "duplicate": "\"{{app}}\" est déjà dans la liste",
+        "appsTitle": "Apps à mettre en pause",
+        "appsDescription": "Noms de processus tels qu'affichés dans le Moniteur d'activité (insensible à la casse)."
       }
     },
     "postProcessing": {

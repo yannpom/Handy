@@ -330,6 +330,16 @@
         "add": "Add",
         "remove": "Remove {{word}}",
         "duplicate": "\"{{word}}\" already exists"
+      },
+      "pauseApps": {
+        "label": "Pause Apps During Transcription",
+        "description": "Freeze the apps listed below (e.g. a Blender render) while Handy transcribes, so the speech model gets the GPU and CPU to itself. They resume automatically as soon as the text is ready.",
+        "placeholder": "App name",
+        "add": "Add",
+        "remove": "Remove {{app}}",
+        "duplicate": "\"{{app}}\" is already in the list",
+        "appsTitle": "Apps to Pause",
+        "appsDescription": "Process names as shown in Activity Monitor (case-insensitive)."
       }
     },
     "postProcessing": {

@@ -1,3 +1,4 @@
+use crate::app_pauser;
 use crate::audio_toolkit::{apply_custom_words, filter_transcription_output};
 use crate::managers::model::{EngineType, ModelManager};
 use crate::settings::{get_settings, ModelUnloadTimeout};
@@ -429,6 +430,13 @@ impl TranscriptionManager {
     }
 
     pub fn transcribe(&self, audio: Vec<f32>) -> Result<String> {
+        // Pause the user's listed apps (e.g. a GPU render) while this call waits
+        // for and runs the engine. Taken before the lock so segments queued
+        // behind one another keep them paused in between.
+        let pause_settings = get_settings(&self.app_handle);
+        let _pause_guard = (pause_settings.pause_apps_during_transcription && !audio.is_empty())
+            .then(|| app_pauser::pause_apps(&pause_settings.pause_apps_list));
+
         // Serialize: only one transcription at a time.  A second caller
         // blocks here until the first finishes and puts the engine back.
         let _transcribe_guard = self
